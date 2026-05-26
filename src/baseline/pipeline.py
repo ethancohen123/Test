@@ -237,8 +237,8 @@ class MotionPipeline:
                 if _persistence_z(pmap, top.bbox) >= self.cfg.min_init_z:
                     top_ok = True
             if top_ok:
-                H, W = pmap.shape
-                streak_radius = self.cfg.init_streak_radius_frac * (W * W + H * H) ** 0.5
+                Hh, Ww = pmap.shape
+                streak_radius = self.cfg.init_streak_radius_frac * (Ww * Ww + Hh * Hh) ** 0.5
                 cx, cy = cands[0].center
                 if self._last_top_center is not None:
                     dx = cx - self._last_top_center[0]
@@ -263,7 +263,8 @@ class MotionPipeline:
                 self._candidate_streak = 0
                 self._last_top_center = None
         else:
-            ts = self.tracker.update(gray, cands, persistence=pmap)
+            ts = self.tracker.update(gray, cands, persistence=pmap,
+                                       ego_motion_H=H)
 
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=cands,
                           track=ts, persistence=pmap,
@@ -447,6 +448,7 @@ class HybridPipeline:
         # Motion path
         pmap: np.ndarray | None = None
         motion_cands: list[Detection] = []
+        Hmat: np.ndarray | None = None
         if self._prev_raw is None:
             self._prev_raw = raw_gray
         else:
@@ -501,7 +503,8 @@ class HybridPipeline:
                 self._streak = 0
                 self._last_center = None
         else:
-            ts = self.tracker.update(gray, fused, persistence=pmap)
+            ts = self.tracker.update(gray, fused, persistence=pmap,
+                                       ego_motion_H=Hmat)
 
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=fused,
                           track=ts, persistence=pmap,

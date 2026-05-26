@@ -158,9 +158,27 @@ class Tracker:
         self.last_score = float(det.score)
 
     def update(self, gray: np.ndarray, candidates: list[Detection],
-               persistence: np.ndarray | None = None) -> TrackState_:
+               persistence: np.ndarray | None = None,
+               ego_motion_H: np.ndarray | None = None) -> TrackState_:
+        """Update the tracker for one frame.
+
+        `ego_motion_H` is the 3×3 homography that maps points from the
+        *previous* frame's pixel coordinates to the *current* frame's
+        — i.e. the same matrix the motion module already estimates for
+        the persistence map. Passing it lets us compensate for camera
+        motion inside the Kalman state itself, exactly the way
+        StrongSORT / Deep OC-SORT do, which is critical for aerial drone
+        footage where the camera and the target both move.
+        """
         if self.state == TrackState.INIT:
             raise RuntimeError("Tracker.init() must be called first")
+
+        # 0) Camera-motion compensation. Warp the Kalman state (position
+        #    and velocity tip) by the inter-frame homography so the
+        #    predicted state lives in the CURRENT frame's coordinates,
+        #    not the previous frame's.
+        if ego_motion_H is not None:
+            self._warp_state_by_homography(ego_motion_H)
 
         # 1) Predict (also advances errorCovPre, which we use for the gate).
         pred = self.kf.predict()
@@ -237,6 +255,25 @@ class Tracker:
                             appearance=self.appearance)
 
     # ----- helpers -----
+    def _warp_state_by_homography(self, H: np.ndarray) -> None:
+        """Apply inter-frame homography H (prev→curr) to position and
+        velocity in `statePost`. Velocity is warped via a finite-difference
+        approximation: warp (cx + vx, cy + vy) under H, subtract warped
+        (cx, cy); the result is the velocity in the new frame's coords.
+        """
+        cx = float(self.kf.statePost[0, 0])
+        cy = float(self.kf.statePost[1, 0])
+        vx = float(self.kf.statePost[4, 0])
+        vy = float(self.kf.statePost[5, 0])
+        pts = np.array([[[cx, cy], [cx + vx, cy + vy]]], dtype=np.float32)
+        warped = cv2.perspectiveTransform(pts, H.astype(np.float32))
+        ncx, ncy = float(warped[0, 0, 0]), float(warped[0, 0, 1])
+        ntx, nty = float(warped[0, 1, 0]), float(warped[0, 1, 1])
+        self.kf.statePost[0, 0] = ncx
+        self.kf.statePost[1, 0] = ncy
+        self.kf.statePost[4, 0] = ntx - ncx
+        self.kf.statePost[5, 0] = nty - ncy
+
     def _reseed_kalman(self, bbox: tuple[int, int, int, int]) -> None:
         """Snap the Kalman state to a measurement with **zero velocity** and
         reset the posterior covariance. Used on every (re-)acquisition so
