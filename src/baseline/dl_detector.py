@@ -45,7 +45,15 @@ class DLDetector:
         self.model = YOLO(str(weights_path))
         self.names: dict[int, str] = dict(self.model.names)
 
-    def __call__(self, frame_bgr: np.ndarray) -> list[Detection]:
+    def __call__(self, frame_bgr: np.ndarray,
+                 invert: bool = False) -> list[Detection]:
+        """Run inference. If `invert=True`, the input is bit-inverted
+        first — used when the current scene is black-hot but the model
+        was trained on white-hot (common for thermal HUMAN detectors).
+        """
+        import cv2  # local import to keep module light when DL unused
+        if invert:
+            frame_bgr = cv2.bitwise_not(frame_bgr)
         kwargs = dict(conf=self.cfg.conf, imgsz=self.cfg.imgsz,
                        iou=self.cfg.iou, max_det=self.cfg.max_det,
                        verbose=False)

@@ -350,3 +350,163 @@ class DLPipeline:
     def run(self, frames: Iterable[tuple[int, np.ndarray]]) -> Iterable[StepResult]:
         for idx, bgr in frames:
             yield self.step(idx, bgr)
+
+
+# ---------------------------------------------------------------------------
+# phase 2 (hybrid): DL detector + motion persistence + everything else
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HybridPipelineConfig:
+    """Hybrid = DL person prior + motion temporal evidence, full pipeline.
+
+    Reuses every component built in phase 1 (modality monitor,
+    persistence map, bad-diff guard, ego-motion homography) and adds the
+    DL detector as a second candidate source. The tracker's persistence
+    AND-gate cross-validation is *back on* because we again have a
+    persistence map.
+    """
+    preproc: PreprocConfig = field(default_factory=PreprocConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
+    detector_motion: MotionDetectorConfig = field(default_factory=MotionDetectorConfig)
+    tracker: TrackerConfig = field(default_factory=TrackerConfig)
+    modality: ModalityConfig = field(default_factory=ModalityConfig)
+    dl_detector: object | None = None      # DLDetectorConfig (typed lazily)
+
+    # Init gate on the joint score (DL conf + λ·motion_z).
+    min_init_joint: float = 0.20
+    init_streak: int = 3
+    init_streak_radius_frac: float = 0.12
+    warmup_frames: int = 3
+
+    motion_weight: float = 0.05
+
+    bad_diff_window: int = 20
+    bad_diff_k: float = 3.0
+    bad_diff_fraction: float = 0.30
+
+
+class HybridPipeline:
+    """DL ∪ motion candidates, each cross-scored with motion-persistence
+    z. Same Kalman + Mahalanobis + AND-gate tracker as the motion
+    pipeline. Same modality reset. DL input is polarity-corrected
+    (inverted on black-hot frames) so the white-hot-trained YOLO
+    sees the polarity it expects.
+    """
+
+    def __init__(self, cfg: HybridPipelineConfig | None = None):
+        from .dl_detector import DLDetector, DLDetectorConfig
+
+        self.cfg = cfg or HybridPipelineConfig()
+        self._modality = ModalityMonitor(self.cfg.modality)
+        self._persistence = PersistenceMap(self.cfg.motion)
+        self._prev_raw: np.ndarray | None = None
+        self.dl = DLDetector(self.cfg.dl_detector or DLDetectorConfig())
+        self.tracker = Tracker(self.cfg.tracker)
+        self._white_hot: bool | None = self.cfg.preproc.assume_white_hot
+        self._initialised = False
+        self._streak = 0
+        self._last_center: tuple[float, float] | None = None
+        self._diff_medians: list[float] = []
+
+    def _hard_reset_temporal(self) -> None:
+        self._persistence.reset()
+        self._prev_raw = None
+        self._initialised = False
+        self._streak = 0
+        self._last_center = None
+        self._white_hot = None
+        self.tracker = Tracker(self.cfg.tracker)
+
+    def _is_bad_diff(self, diff: np.ndarray) -> bool:
+        med = float(np.median(diff))
+        frac = float((diff > 50).mean())
+        bad = False
+        if len(self._diff_medians) >= self.cfg.bad_diff_window:
+            history = np.asarray(self._diff_medians[-self.cfg.bad_diff_window:])
+            h_med = float(np.median(history))
+            h_mad = float(np.median(np.abs(history - h_med))) * 1.4826
+            thr = h_med + self.cfg.bad_diff_k * max(h_mad, 1.0)
+            if med > thr or frac > self.cfg.bad_diff_fraction:
+                bad = True
+        self._diff_medians.append(med)
+        if len(self._diff_medians) > 2 * self.cfg.bad_diff_window:
+            self._diff_medians = self._diff_medians[-self.cfg.bad_diff_window:]
+        return bad
+
+    def step(self, frame_idx: int, frame_bgr: np.ndarray) -> StepResult:
+        raw_gray = to_gray(frame_bgr)
+        switched = self._modality.step(raw_gray, frame_bgr)
+        if switched:
+            self._hard_reset_temporal()
+        if self._white_hot is None:
+            self._white_hot = detect_polarity_white_hot(raw_gray)
+        gray = preprocess(frame_bgr, self.cfg.preproc, self._white_hot)
+
+        # Motion path
+        pmap: np.ndarray | None = None
+        motion_cands: list[Detection] = []
+        if self._prev_raw is None:
+            self._prev_raw = raw_gray
+        else:
+            Hmat = estimate_homography(self._prev_raw, raw_gray, self.cfg.motion)
+            diff = compensated_diff(self._prev_raw, raw_gray, Hmat, self.cfg.motion)
+            self._prev_raw = raw_gray
+            if self._is_bad_diff(diff):
+                self._persistence.reset()
+            else:
+                pmap = self._persistence.update(diff, Hmat)
+                motion_cands = detect_motion(pmap, self.cfg.detector_motion)
+
+        # DL path with polarity correction
+        invert = not bool(self._white_hot)
+        dl_cands = self.dl(frame_bgr, invert=invert)
+
+        # Joint scoring
+        fused: list[Detection] = []
+        for d in dl_cands:
+            z = _persistence_z(pmap, d.bbox) if pmap is not None else 0.0
+            joint = float(d.score) + self.cfg.motion_weight * max(z, 0.0)
+            fused.append(Detection(bbox=d.bbox, score=joint, area=d.area))
+        for d in motion_cands:
+            z = _persistence_z(pmap, d.bbox) if pmap is not None else 0.0
+            base = float(np.tanh(max(z, 0.0) / 4.0))
+            joint = base + self.cfg.motion_weight * max(z, 0.0)
+            fused.append(Detection(bbox=d.bbox, score=joint, area=d.area))
+        fused.sort(key=lambda c: c.score, reverse=True)
+
+        ts: TrackState_ | None = None
+        if not self._initialised:
+            if (frame_idx >= self.cfg.warmup_frames and fused and
+                    fused[0].score >= self.cfg.min_init_joint):
+                Hh, Ww = gray.shape
+                radius = self.cfg.init_streak_radius_frac * (Ww * Ww + Hh * Hh) ** 0.5
+                cx, cy = fused[0].center
+                if self._last_center is not None:
+                    dx, dy = cx - self._last_center[0], cy - self._last_center[1]
+                    self._streak = (self._streak + 1
+                                     if (dx * dx + dy * dy) ** 0.5 < radius else 1)
+                else:
+                    self._streak = 1
+                self._last_center = (cx, cy)
+                if self._streak >= self.cfg.init_streak:
+                    seed = fused[0]
+                    self.tracker.init(gray, seed)
+                    self._initialised = True
+                    ts = TrackState_(bbox=seed.bbox,
+                                      state=TrackState.TRACKING,
+                                      coast_frames=0, score=float(seed.score))
+            else:
+                self._streak = 0
+                self._last_center = None
+        else:
+            ts = self.tracker.update(gray, fused, persistence=pmap)
+
+        return StepResult(frame_idx=frame_idx, gray=gray, candidates=fused,
+                          track=ts, persistence=pmap,
+                          modality_switched=switched)
+
+    def run(self, frames):
+        for idx, bgr in frames:
+            yield self.step(idx, bgr)
