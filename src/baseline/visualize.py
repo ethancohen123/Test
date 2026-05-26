@@ -67,3 +67,18 @@ def side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
         scale = right.shape[0] / left.shape[0]
         left = cv2.resize(left, (int(left.shape[1] * scale), right.shape[0]))
     return np.hstack([left, right])
+
+
+def persistence_heatmap(pmap: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray:
+    """Render the persistence map as a JET-colormapped BGR image."""
+    h, w = shape
+    if pmap is None:
+        return np.zeros((h, w, 3), dtype=np.uint8)
+    m = pmap.astype(np.float32)
+    m = np.clip(m, 0, None)
+    mx = float(m.max()) if m.size else 0.0
+    if mx > 1e-3:
+        m = (255.0 * m / mx).astype(np.uint8)
+    else:
+        m = np.zeros_like(m, dtype=np.uint8)
+    return cv2.applyColorMap(m, cv2.COLORMAP_JET)
