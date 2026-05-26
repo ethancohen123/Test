@@ -187,19 +187,26 @@ class Tracker:
             return None
         px, py, pw, ph = pred_bbox
         pcx, pcy = px + pw / 2.0, py + ph / 2.0
+        # When LOST, the Kalman prediction is stale (velocity-driven drift
+        # since the last measurement). Drop the spatial gate and rank only
+        # by appearance + raw detector score. Otherwise apply the usual gate.
+        gated = self.state != TrackState.LOST
         radius = self.cfg.redetect_gate_scale * max(pw, ph)
 
         best: tuple[float, Detection] | None = None
         for d in candidates:
             cx, cy = d.center
             dist = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
-            if dist > radius:
+            if gated and dist > radius:
                 continue
-            # Score = appearance match minus a mild distance penalty.
             patch = _appearance_patch(gray, d.bbox)
             app = _ncc(patch, self.appearance) if self.appearance is not None else 0.0
-            penalty = dist / max(radius, 1.0)
-            s = app - 0.5 * penalty
+            if gated:
+                penalty = dist / max(radius, 1.0)
+                s = app - 0.5 * penalty
+            else:
+                # No gate; appearance + normalised detector score.
+                s = app + 0.001 * float(d.score)
             if best is None or s > best[0]:
                 best = (s, d)
         if best is None:

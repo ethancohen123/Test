@@ -23,8 +23,8 @@ from baseline.io_utils import VideoWriter, iter_frames, probe  # noqa: E402
 from baseline.pipeline import (MotionPipeline, MotionPipelineConfig,  # noqa: E402
                                 Pipeline, PipelineConfig)
 from baseline.tracker import TrackState  # noqa: E402
-from baseline.visualize import (draw_candidates, draw_hud, draw_track,  # noqa: E402
-                                  persistence_heatmap, side_by_side)
+from baseline.visualize import (draw_candidates, draw_hud, draw_legend,  # noqa: E402
+                                  draw_track, persistence_heatmap, side_by_side)
 
 
 def _build_pipeline(args):
@@ -86,6 +86,9 @@ def main() -> None:
                 else:
                     left = res.gray
                 annotated = side_by_side(left, annotated)
+            # Legend last, on the composed image (lives on the left panel
+            # when side-by-side is on, so it never collides with the track).
+            annotated = draw_legend(annotated)
             writer.write(annotated)
             n += 1
 
