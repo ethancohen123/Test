@@ -174,16 +174,23 @@ class Tracker:
                 x, y, w, h = raw
                 csrt_bbox = (int(x), int(y), int(w), int(h))
 
-        # 3) AND-gate the CSRT measurement: it must satisfy BOTH
-        #    appearance (NCC against stored model) AND independent motion
-        #    evidence (persistence z-score above background).
+        # 3) Gate the CSRT measurement. When a persistence map is
+        #    available (motion pipeline) we AND-gate appearance with
+        #    independent motion evidence. When it is absent (DL pipeline)
+        #    we rely on appearance NCC alone — the detector itself is
+        #    the second evidence source, applied earlier.
         meas_bbox: tuple[int, int, int, int] | None = None
         score = 0.0
         if csrt_ok and csrt_bbox is not None:
             app = (_ncc(_appearance_patch(gray, csrt_bbox), self.appearance)
                    if self.appearance is not None else 0.0)
-            p_z = _persistence_z(persistence, csrt_bbox)
-            if app >= self.cfg.min_appearance_ncc and p_z >= self.cfg.min_persistence_z:
+            if persistence is not None:
+                p_z = _persistence_z(persistence, csrt_bbox)
+                ok = (app >= self.cfg.min_appearance_ncc and
+                      p_z >= self.cfg.min_persistence_z)
+            else:
+                ok = app >= self.cfg.min_appearance_ncc
+            if ok:
                 meas_bbox = csrt_bbox
                 score = app
                 self.state = TrackState.TRACKING
@@ -279,16 +286,24 @@ class Tracker:
             radius_floor = max(min_r, self.cfg.gate_sigma * max(sx, sy))
             if mahal2 > chi2_gate and dist > radius_floor:
                 continue
-            # Appearance + persistence cross-validation. We allow either
-            # signal to be borderline as long as the other is strong.
+            # Evidence test. With a persistence map (motion pipeline) we
+            # let either appearance or motion clear the bar. Without one
+            # (DL pipeline) the detector's own confidence already gated
+            # this candidate, so we just need it not to look like a
+            # totally different patch.
             app = (_ncc(_appearance_patch(gray, d.bbox), self.appearance)
                    if self.appearance is not None else 0.0)
-            p_z = _persistence_z(persistence, d.bbox)
-            if app < self.cfg.min_appearance_ncc and p_z < self.cfg.min_persistence_z:
-                continue
-            # Joint score — appearance plus mild bonus for stronger motion
-            # evidence and a small penalty for Mahalanobis distance.
-            s = app + 0.05 * p_z - 0.02 * mahal2
+            if persistence is not None:
+                p_z = _persistence_z(persistence, d.bbox)
+                if app < self.cfg.min_appearance_ncc and p_z < self.cfg.min_persistence_z:
+                    continue
+                s = app + 0.05 * p_z - 0.02 * mahal2
+            else:
+                # Treat very-bad appearance as disqualifying; otherwise
+                # rank by detector score + small Mahalanobis penalty.
+                if app < -0.2:
+                    continue
+                s = app + 0.001 * float(d.score) - 0.02 * mahal2
             if best is None or s > best[0]:
                 best = (s, d.bbox)
         return best[1] if best else None

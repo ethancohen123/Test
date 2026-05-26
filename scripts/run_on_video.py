@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from baseline.io_utils import VideoWriter, iter_frames, probe  # noqa: E402
-from baseline.pipeline import (MotionPipeline, MotionPipelineConfig,  # noqa: E402
+from baseline.pipeline import (DLPipeline, DLPipelineConfig,  # noqa: E402
+                                MotionPipeline, MotionPipelineConfig,
                                 Pipeline, PipelineConfig)
 from baseline.tracker import TrackState  # noqa: E402
 from baseline.visualize import (draw_candidates, draw_hud, draw_legend,  # noqa: E402
@@ -28,19 +29,34 @@ from baseline.visualize import (draw_candidates, draw_hud, draw_legend,  # noqa:
 
 
 def _build_pipeline(args):
+    """Return (pipeline, side_panel_kind) where side_panel_kind is one of
+    'persistence' | 'gray' | 'detections'."""
     if args.pipeline == "motion":
-        return MotionPipeline(MotionPipelineConfig()), True
+        return MotionPipeline(MotionPipelineConfig()), "persistence"
+    if args.pipeline == "dl":
+        from baseline.dl_detector import DLDetectorConfig
+        det_cfg = DLDetectorConfig(weights=args.dl_weights,
+                                    conf=args.dl_conf,
+                                    imgsz=args.dl_imgsz)
+        return DLPipeline(DLPipelineConfig(dl_detector=det_cfg)), "gray"
     cfg = PipelineConfig(init_frame_index=args.init_frame)
     if args.init_bbox:
         cfg.init_bbox = tuple(int(v) for v in args.init_bbox.split(","))  # type: ignore[assignment]
-    return Pipeline(cfg), False
+    return Pipeline(cfg), "gray"
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--video", required=True)
     p.add_argument("--out", default="outputs/baseline.mp4")
-    p.add_argument("--pipeline", choices=["motion", "intensity"], default="motion")
+    p.add_argument("--pipeline", choices=["motion", "intensity", "dl"],
+                    default="motion")
+    p.add_argument("--dl-weights", default="weights/yolov8_thermal.pt",
+                    help="(dl pipeline) path to .pt weights")
+    p.add_argument("--dl-conf", type=float, default=0.10,
+                    help="(dl pipeline) detector confidence floor")
+    p.add_argument("--dl-imgsz", type=int, default=640,
+                    help="(dl pipeline) inference image size")
     p.add_argument("--side-by-side", action="store_true",
                     help="Pipe-aware side panel: persistence heatmap for "
                           "motion, CLAHE gray for intensity")
@@ -55,7 +71,7 @@ def main() -> None:
     print(f"video: {args.video} {meta.width}x{meta.height} @ {meta.fps:.1f}fps "
           f"({meta.n_frames} frames)  pipeline={args.pipeline}")
 
-    pipe, is_motion = _build_pipeline(args)
+    pipe, side_kind = _build_pipeline(args)
     trail: list[tuple[int, int]] = []
     writer = VideoWriter(args.out, fps=meta.fps)
 
@@ -80,7 +96,7 @@ def main() -> None:
                 counts[res.track.state] = counts.get(res.track.state, 0) + 1
             annotated = draw_hud(annotated, idx, len(res.candidates), res.track)
             if args.side_by_side:
-                if is_motion:
+                if side_kind == "persistence":
                     left = persistence_heatmap(res.persistence,
                                                 shape=frame.shape[:2])
                 else:

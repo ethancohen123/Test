@@ -1,8 +1,11 @@
 """End-to-end baseline pipelines.
 
-`Pipeline` — v1 intensity-only baseline (top-hat + CSRT).
-`MotionPipeline` — v2 unsupervised motion-aware baseline: ego-motion
-    compensated temporal persistence drives both detection and auto-init.
+All pipelines share the same `StepResult` shape and the same tracker
+(`Tracker`); they differ only in how candidate detections are generated:
+
+`Pipeline`          — v1 intensity-only baseline (top-hat + CSRT).
+`MotionPipeline`    — v2 unsupervised motion-aware baseline.
+`DLPipeline`        — phase 2: pretrained DL detector + same tracker.
 """
 from __future__ import annotations
 
@@ -265,6 +268,84 @@ class MotionPipeline:
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=cands,
                           track=ts, persistence=pmap,
                           modality_switched=switched)
+
+    def run(self, frames: Iterable[tuple[int, np.ndarray]]) -> Iterable[StepResult]:
+        for idx, bgr in frames:
+            yield self.step(idx, bgr)
+
+
+# ---------------------------------------------------------------------------
+# phase 2: deep-learning detector + reused tracker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DLPipelineConfig:
+    preproc: PreprocConfig = field(default_factory=PreprocConfig)
+    tracker: TrackerConfig = field(default_factory=TrackerConfig)
+    dl_detector: object | None = None      # DLDetectorConfig (typed lazily)
+    init_min_conf: float = 0.25
+    init_streak: int = 3
+    init_streak_radius_frac: float = 0.12
+
+
+class DLPipeline:
+    """Per frame: run pretrained detector, feed candidates into the same
+    Kalman + CSRT + Mahalanobis tracker the motion pipeline uses. No
+    persistence map is computed → the tracker's persistence
+    cross-validation is disabled automatically (appearance NCC alone
+    gates measurements).
+    """
+
+    def __init__(self, cfg: DLPipelineConfig | None = None):
+        # Lazy import so classical baselines do not require torch / ultralytics.
+        from .dl_detector import DLDetector, DLDetectorConfig
+
+        self.cfg = cfg or DLPipelineConfig()
+        det_cfg = self.cfg.dl_detector or DLDetectorConfig()
+        self.detector = DLDetector(det_cfg)
+        self.tracker = Tracker(self.cfg.tracker)
+        self._white_hot: bool | None = self.cfg.preproc.assume_white_hot
+        self._initialised = False
+        self._streak = 0
+        self._last_center: tuple[float, float] | None = None
+
+    def step(self, frame_idx: int, frame_bgr: np.ndarray) -> StepResult:
+        raw_gray = to_gray(frame_bgr)
+        if self._white_hot is None:
+            self._white_hot = detect_polarity_white_hot(raw_gray)
+        gray = preprocess(frame_bgr, self.cfg.preproc, self._white_hot)
+        cands = self.detector(frame_bgr)
+
+        ts: TrackState_ | None = None
+        if not self._initialised:
+            if cands and cands[0].score >= self.cfg.init_min_conf:
+                Hh, Ww = gray.shape
+                radius = self.cfg.init_streak_radius_frac * (Ww * Ww + Hh * Hh) ** 0.5
+                cx, cy = cands[0].center
+                if self._last_center is not None:
+                    dx, dy = cx - self._last_center[0], cy - self._last_center[1]
+                    self._streak = (self._streak + 1
+                                     if (dx * dx + dy * dy) ** 0.5 < radius else 1)
+                else:
+                    self._streak = 1
+                self._last_center = (cx, cy)
+                if self._streak >= self.cfg.init_streak:
+                    seed = cands[0]
+                    self.tracker.init(gray, seed)
+                    self._initialised = True
+                    ts = TrackState_(bbox=seed.bbox,
+                                      state=TrackState.TRACKING,
+                                      coast_frames=0,
+                                      score=float(seed.score))
+            else:
+                self._streak = 0
+                self._last_center = None
+        else:
+            ts = self.tracker.update(gray, cands, persistence=None)
+
+        return StepResult(frame_idx=frame_idx, gray=gray, candidates=cands,
+                          track=ts, persistence=None, modality_switched=False)
 
     def run(self, frames: Iterable[tuple[int, np.ndarray]]) -> Iterable[StepResult]:
         for idx, bgr in frames:
