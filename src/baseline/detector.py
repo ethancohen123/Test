@@ -91,8 +91,11 @@ def detect(gray: np.ndarray, cfg: DetectorConfig) -> list[Detection]:
 
 @dataclass
 class MotionDetectorConfig:
-    abs_thresh: float = 6.0        # min persistence value (0-255 scale)
-    rel_thresh_pct: float = 99.0   # alternative: percentile-based
+    # Threshold = median(persistence) + k_mad * 1.4826 * MAD(persistence).
+    # That is a k_mad-sigma anomaly cut against the actual map distribution
+    # — adapts to whatever level of warp-residual noise the scene has.
+    k_mad: float = 4.0
+    abs_floor: float = 2.0         # numerical-noise floor (not video tuned)
     min_area: int = 12
     max_area: int = 6000
     min_aspect: float = 0.15
@@ -112,9 +115,11 @@ def detect_motion(persistence: np.ndarray,
     if persistence is None:
         return []
     p = persistence
-    # Combine an absolute floor with a percentile to adapt to global level.
-    pct = float(np.percentile(p, cfg.rel_thresh_pct))
-    thr = max(cfg.abs_thresh, pct)
+    flat = p.ravel()
+    med = float(np.median(flat))
+    mad = float(np.median(np.abs(flat - med))) * 1.4826  # σ-equivalent
+    data_thr = med + cfg.k_mad * mad
+    thr = max(cfg.abs_floor, data_thr)
     bw = (p >= thr).astype(np.uint8) * 255
     if cfg.open_ksize >= 3:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
