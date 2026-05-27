@@ -884,9 +884,13 @@ class IDPipeline:
             Hmat = estimate_homography(self._prev_raw, raw_gray, self.cfg.motion)
         self._prev_raw = raw_gray
 
-        # DL detections, polarity-corrected.
-        invert = not bool(self._white_hot)
-        dl_cands = self.dl(frame_bgr, invert=invert)
+        # DL detections.
+        # Empirical: bit-inverting the input to YOLO on "black-hot"
+        # frames *hurts* recall on this checkpoint (the model is
+        # apparently robust to either polarity, and our inversion
+        # introduces texture artefacts that look like edge-of-image
+        # bodies). We pass the raw frame.
+        dl_cands = self.dl(frame_bgr, invert=False)
 
         # Multi-track update.
         active_tracks = self.id_tracker.step(

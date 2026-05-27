@@ -402,12 +402,21 @@ class IdentityTracker:
         # Two budgets, DeepSORT-style: tentative tracks die fast,
         # confirmed tracks survive a long YOLO silence.
         survived_active: list[IdentityTrack] = []
+        H, W = gray.shape
         for t in self.active:
             if t.last_seen_frame == self._frame_idx:
                 survived_active.append(t)
                 continue
             t.coast_frames += 1
             t.bbox = _state_to_bbox(t.kf.statePost[:4])
+
+            # Off-screen guard: if the Kalman center has drifted outside
+            # the image bounds, the prediction is meaningless — kill the
+            # track now rather than render it as an edge-clamped sliver.
+            cx = float(t.kf.statePost[0, 0])
+            cy = float(t.kf.statePost[1, 0])
+            off_screen = (cx < 0 or cx >= W or cy < 0 or cy >= H)
+
             sane = _sanitise_bbox(t.bbox, gray.shape, self.cfg.min_bbox_side)
             if sane is not None:
                 t.bbox = sane
@@ -415,7 +424,7 @@ class IdentityTracker:
             is_confirmed = t.hits >= self.cfg.tentative_hits
             budget = (self.cfg.confirmed_max_coast if is_confirmed
                       else self.cfg.tentative_max_coast)
-            if t.coast_frames > budget:
+            if off_screen or t.coast_frames > budget or sane is None:
                 if is_confirmed:
                     # Confirmed tracks go to the lost pool for ReID.
                     t.state = TrackState.LOST
