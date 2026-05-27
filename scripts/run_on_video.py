@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from baseline.io_utils import VideoWriter, iter_frames, probe  # noqa: E402
 from baseline.pipeline import (DLPipeline, DLPipelineConfig,  # noqa: E402
+                                FollowingPipeline, FollowingPipelineConfig,
                                 HybridPipeline, HybridPipelineConfig,
                                 MotionPipeline, MotionPipelineConfig,
                                 Pipeline, PipelineConfig)
@@ -47,6 +48,13 @@ def _build_pipeline(args):
                                     imgsz=args.dl_imgsz)
         return (HybridPipeline(HybridPipelineConfig(dl_detector=det_cfg)),
                 "persistence")
+    if args.pipeline == "follow":
+        from baseline.dl_detector import DLDetectorConfig
+        det_cfg = DLDetectorConfig(weights=args.dl_weights,
+                                    conf=args.dl_conf,
+                                    imgsz=args.dl_imgsz)
+        return (FollowingPipeline(FollowingPipelineConfig(dl_detector=det_cfg)),
+                "persistence")
     cfg = PipelineConfig(init_frame_index=args.init_frame)
     if args.init_bbox:
         cfg.init_bbox = tuple(int(v) for v in args.init_bbox.split(","))  # type: ignore[assignment]
@@ -58,7 +66,7 @@ def main() -> None:
     p.add_argument("--video", required=True)
     p.add_argument("--out", default="outputs/baseline.mp4")
     p.add_argument("--pipeline",
-                    choices=["motion", "intensity", "dl", "hybrid"],
+                    choices=["motion", "intensity", "dl", "hybrid", "follow"],
                     default="motion")
     p.add_argument("--dl-weights", default="weights/yolov8_thermal.pt",
                     help="(dl pipeline) path to .pt weights")
