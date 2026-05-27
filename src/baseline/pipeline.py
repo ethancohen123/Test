@@ -812,3 +812,95 @@ class FollowingPipeline:
     def run(self, frames):
         for idx, bgr in frames:
             yield self.step(idx, bgr)
+
+
+# ---------------------------------------------------------------------------
+# phase 3: multi-object identity tracker with ReID (BoT-SORT-style)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IDPipelineConfig:
+    """Multi-track pipeline.
+
+    YOLO detects everything each frame; IdentityTracker assigns one
+    persistent integer ID per object via a three-stage cascade
+    (IoU → appearance → lost-pool re-ID). Camera-motion compensation
+    and modality switching are inherited from the rest of the codebase.
+    """
+    preproc: PreprocConfig = field(default_factory=PreprocConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
+    modality: ModalityConfig = field(default_factory=ModalityConfig)
+    dl_detector: object | None = None
+    id_tracker: object | None = None      # IdentityTrackerConfig
+
+
+@dataclass
+class IDStepResult:
+    """Per-frame output for the multi-track pipeline.
+
+    Mirrors `StepResult` but carries a *list* of tracks instead of one.
+    """
+    frame_idx: int
+    gray: np.ndarray
+    candidates: list[Detection]
+    tracks: list                          # list[IdentityTrack]
+    persistence: np.ndarray | None = None
+    modality_switched: bool = False
+
+
+class IDPipeline:
+    """YOLO + IdentityTracker. The detector decides "what's there";
+    the IdentityTracker assigns persistent IDs across frames including
+    re-identification after the target temporarily disappears.
+    """
+
+    def __init__(self, cfg: IDPipelineConfig | None = None):
+        from .dl_detector import DLDetector, DLDetectorConfig
+        from .id_tracker import IdentityTracker, IdentityTrackerConfig
+
+        self.cfg = cfg or IDPipelineConfig()
+        self._modality = ModalityMonitor(self.cfg.modality)
+        self._prev_raw: np.ndarray | None = None
+        self.dl = DLDetector(self.cfg.dl_detector or DLDetectorConfig())
+        self.id_tracker = IdentityTracker(
+            self.cfg.id_tracker or IdentityTrackerConfig())
+        self._white_hot: bool | None = self.cfg.preproc.assume_white_hot
+
+    def step(self, frame_idx: int, frame_bgr: np.ndarray) -> IDStepResult:
+        raw_gray = to_gray(frame_bgr)
+        switched = self._modality.step(raw_gray, frame_bgr)
+        if switched:
+            self.id_tracker.reset()
+            self._prev_raw = None
+            self._white_hot = None
+        if self._white_hot is None:
+            self._white_hot = detect_polarity_white_hot(raw_gray)
+        gray = preprocess(frame_bgr, self.cfg.preproc, self._white_hot)
+
+        # Ego-motion homography (cheap; reused for the Kalman warp).
+        Hmat = None
+        if self._prev_raw is not None:
+            Hmat = estimate_homography(self._prev_raw, raw_gray, self.cfg.motion)
+        self._prev_raw = raw_gray
+
+        # DL detections, polarity-corrected.
+        invert = not bool(self._white_hot)
+        dl_cands = self.dl(frame_bgr, invert=invert)
+
+        # Multi-track update.
+        active_tracks = self.id_tracker.step(
+            dl_cands, gray, frame_bgr, ego_motion_H=Hmat)
+
+        return IDStepResult(
+            frame_idx=frame_idx,
+            gray=gray,
+            candidates=dl_cands,
+            tracks=list(active_tracks),
+            persistence=None,
+            modality_switched=switched,
+        )
+
+    def run(self, frames):
+        for idx, bgr in frames:
+            yield self.step(idx, bgr)

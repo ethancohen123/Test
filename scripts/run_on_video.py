@@ -23,10 +23,12 @@ from baseline.io_utils import VideoWriter, iter_frames, probe  # noqa: E402
 from baseline.pipeline import (DLPipeline, DLPipelineConfig,  # noqa: E402
                                 FollowingPipeline, FollowingPipelineConfig,
                                 HybridPipeline, HybridPipelineConfig,
+                                IDPipeline, IDPipelineConfig,
                                 MotionPipeline, MotionPipelineConfig,
                                 Pipeline, PipelineConfig)
 from baseline.tracker import TrackState  # noqa: E402
-from baseline.visualize import (draw_candidates, draw_hud, draw_legend,  # noqa: E402
+from baseline.visualize import (draw_candidates, draw_hud, draw_identity_legend,  # noqa: E402
+                                  draw_identity_tracks, draw_legend,
                                   draw_track, persistence_heatmap, side_by_side)
 
 
@@ -55,6 +57,12 @@ def _build_pipeline(args):
                                     imgsz=args.dl_imgsz)
         return (FollowingPipeline(FollowingPipelineConfig(dl_detector=det_cfg)),
                 "persistence")
+    if args.pipeline == "ids":
+        from baseline.dl_detector import DLDetectorConfig
+        det_cfg = DLDetectorConfig(weights=args.dl_weights,
+                                    conf=args.dl_conf,
+                                    imgsz=args.dl_imgsz)
+        return (IDPipeline(IDPipelineConfig(dl_detector=det_cfg)), "gray")
     cfg = PipelineConfig(init_frame_index=args.init_frame)
     if args.init_bbox:
         cfg.init_bbox = tuple(int(v) for v in args.init_bbox.split(","))  # type: ignore[assignment]
@@ -66,7 +74,8 @@ def main() -> None:
     p.add_argument("--video", required=True)
     p.add_argument("--out", default="outputs/baseline.mp4")
     p.add_argument("--pipeline",
-                    choices=["motion", "intensity", "dl", "hybrid", "follow"],
+                    choices=["motion", "intensity", "dl", "hybrid",
+                              "follow", "ids"],
                     default="motion")
     p.add_argument("--dl-weights", default="weights/yolov8_thermal.pt",
                     help="(dl pipeline) path to .pt weights")
@@ -97,31 +106,48 @@ def main() -> None:
     n = 0
     t0 = time.time()
     stop = args.max_frames or None
+    id_max_seen = 0   # multi-track only
     with writer:
         for idx, frame in iter_frames(args.video, stop=stop):
             res = pipe.step(idx, frame)
             if res.modality_switched:
                 n_switches += 1
                 trail.clear()
-            annotated = draw_candidates(frame, res.candidates)
-            if res.track is not None:
-                x, y, w, h = res.track.bbox
-                trail.append((x + w // 2, y + h // 2))
-                if len(trail) > 60:
-                    trail = trail[-60:]
-                annotated = draw_track(annotated, res.track, trail)
-                counts[res.track.state] = counts.get(res.track.state, 0) + 1
-            annotated = draw_hud(annotated, idx, len(res.candidates), res.track)
-            if args.side_by_side:
-                if side_kind == "persistence":
-                    left = persistence_heatmap(res.persistence,
-                                                shape=frame.shape[:2])
-                else:
-                    left = res.gray
-                annotated = side_by_side(left, annotated)
-            # Legend last, on the composed image (lives on the left panel
-            # when side-by-side is on, so it never collides with the track).
-            annotated = draw_legend(annotated)
+
+            # Two render paths: multi-ID pipeline vs single-target pipelines.
+            if args.pipeline == "ids":
+                annotated = draw_candidates(frame, res.candidates)
+                annotated = draw_identity_tracks(annotated, res.tracks)
+                # Count active tracks by state for the stats line.
+                for t in res.tracks:
+                    counts[t.state] = counts.get(t.state, 0) + 1
+                    id_max_seen = max(id_max_seen, t.id)
+                annotated = draw_hud(annotated, idx,
+                                      len(res.candidates), None)
+                if args.side_by_side:
+                    annotated = side_by_side(res.gray, annotated)
+                lost_count = len(getattr(pipe.id_tracker, 'lost', []))
+                annotated = draw_identity_legend(annotated, res.tracks,
+                                                   lost_count=lost_count)
+            else:
+                annotated = draw_candidates(frame, res.candidates)
+                if res.track is not None:
+                    x, y, w, h = res.track.bbox
+                    trail.append((x + w // 2, y + h // 2))
+                    if len(trail) > 60:
+                        trail = trail[-60:]
+                    annotated = draw_track(annotated, res.track, trail)
+                    counts[res.track.state] = counts.get(res.track.state, 0) + 1
+                annotated = draw_hud(annotated, idx, len(res.candidates),
+                                      res.track)
+                if args.side_by_side:
+                    if side_kind == "persistence":
+                        left = persistence_heatmap(res.persistence,
+                                                    shape=frame.shape[:2])
+                    else:
+                        left = res.gray
+                    annotated = side_by_side(left, annotated)
+                annotated = draw_legend(annotated)
             writer.write(annotated)
             n += 1
 
@@ -131,6 +157,8 @@ def main() -> None:
     total_track = sum(counts.values()) or 1
     for s, c in counts.items():
         print(f"  {s.name:9s}  {c:4d}  ({100 * c / total_track:5.1f}%)")
+    if args.pipeline == "ids":
+        print(f"  IDs assigned: {id_max_seen}")
     print(f"wrote {args.out}")
 
 

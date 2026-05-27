@@ -145,3 +145,79 @@ def persistence_heatmap(pmap: np.ndarray | None, shape: tuple[int, int]) -> np.n
     else:
         m = np.zeros_like(m, dtype=np.uint8)
     return cv2.applyColorMap(m, cv2.COLORMAP_JET)
+
+
+# --------------------------------------------------------------------------- #
+# ID-aware drawing (multi-target identity pipeline)
+# --------------------------------------------------------------------------- #
+
+
+_PHI_INV = 0.6180339887498949   # golden-ratio conjugate, spreads hues nicely
+
+
+def id_to_color(track_id: int) -> tuple[int, int, int]:
+    """Deterministic vivid BGR colour for a given integer ID.
+
+    Uses a golden-ratio hop on hue so consecutive IDs land far apart
+    on the colour wheel. Saturation and value are fixed-bright so the
+    colours stand out on dim thermal backgrounds.
+    """
+    import colorsys
+    h = (track_id * _PHI_INV) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.85, 0.95)
+    return (int(b * 255), int(g * 255), int(r * 255))
+
+
+def draw_identity_tracks(frame: np.ndarray, tracks) -> np.ndarray:
+    """Draw each track with its unique ID colour and label.
+
+    Solid box for TRACKING; dashed for COASTING; LOST tracks aren't in
+    the active list so they don't appear here.
+    """
+    out = frame.copy()
+    for t in tracks:
+        col = id_to_color(t.id)
+        x, y, w, h = t.bbox
+        if t.state == TrackState.COASTING:
+            _dashed_rect(out, (x, y), (x + w, y + h), col, thickness=2)
+        else:
+            cv2.rectangle(out, (x, y), (x + w, y + h), col, 2)
+        label = f"ID {t.id}"
+        if t.state == TrackState.COASTING:
+            label += f"  coast={t.coast_frames}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        ly = max(y - 6, th + 4)
+        cv2.rectangle(out, (x, ly - th - 4), (x + tw + 6, ly + 4), (0, 0, 0), -1)
+        cv2.putText(out, label, (x + 3, ly),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+    return out
+
+
+def draw_identity_legend(frame: np.ndarray, tracks,
+                           lost_count: int = 0) -> np.ndarray:
+    """Compact legend for the ID pipeline: shows count of active
+    tracks, lost tracks, and a tiny colour swatch per active ID."""
+    out = frame.copy()
+    pad = 6
+    line_h = 16
+    n_lines = 2 + min(len(tracks), 6)
+    panel_w = 150
+    panel_h = pad + line_h * n_lines + pad
+    overlay = out.copy()
+    cv2.rectangle(overlay, (4, 4), (4 + panel_w, 4 + panel_h), (0, 0, 0), -1)
+    out = cv2.addWeighted(overlay, 0.6, out, 0.4, 0)
+    y = 4 + pad + line_h - 4
+    cv2.putText(out, f"active {len(tracks)}  lost {lost_count}",
+                 (4 + pad, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                 HUD_TEXT, 1, cv2.LINE_AA)
+    y += line_h
+    cv2.putText(out, "IDs:", (4 + pad, y),
+                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, HUD_TEXT, 1, cv2.LINE_AA)
+    y += line_h
+    for t in tracks[:6]:
+        col = id_to_color(t.id)
+        cv2.rectangle(out, (4 + pad, y - 10), (4 + pad + 14, y - 2), col, -1)
+        cv2.putText(out, f"#{t.id}", (4 + pad + 20, y - 2),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, HUD_TEXT, 1, cv2.LINE_AA)
+        y += line_h
+    return out
