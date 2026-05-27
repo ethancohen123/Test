@@ -153,6 +153,21 @@ def build_pipeline(name: str, dl_weights: str, dl_conf: float,
         return (DLPipeline(DLPipelineConfig(dl_detector=dl)),
                 iter_frames, probe)
 
+    if name == "motion_v3_hybrid":
+        # v3 = v2-hybrid + 1-shot exemplar CSRT tracker leg.
+        # Caller may inject (exemplar_frame, exemplar_bbox) via the
+        # pipeline.cfg attribute; the script does that for --seed-from-gt.
+        from baseline_v2.io_utils import iter_frames, probe
+        from baseline_v3_hybrid.pipeline import (HybridV3Config,
+                                                  HybridV3Pipeline)
+        from baseline_v2_hybrid.pipeline import HybridV2Config
+        from baseline.dl_detector import DLDetectorConfig
+        dl = DLDetectorConfig(weights=dl_weights, conf=dl_conf,
+                              imgsz=dl_imgsz)
+        base = HybridV2Config(dl=dl, dl_every_k=dl_every_k)
+        cfg = HybridV3Config(base=base)
+        return HybridV3Pipeline(cfg), iter_frames, probe
+
     raise ValueError(f"unknown pipeline: {name}")
 
 
@@ -196,7 +211,12 @@ def main() -> None:
     p.add_argument("--pipeline", required=True,
                    choices=["motion_v2", "motion_v2_hybrid",
                             "baseline_motion", "baseline_hybrid",
-                            "baseline_dl"])
+                            "baseline_dl", "motion_v3_hybrid"])
+    p.add_argument("--seed-from-gt", action="store_true",
+                   help="(motion_v3_hybrid only) Seed the exemplar "
+                        "tracker from the first GT box in the XML. "
+                        "That GT frame is then excluded from eval to "
+                        "keep the test honest.")
     p.add_argument("--track-id", default="0",
                    help="CVAT track id to evaluate against (default: 0)")
     p.add_argument("--iou-tp", type=float, default=0.5,
@@ -233,6 +253,25 @@ def main() -> None:
     pipe, iter_frames, probe = build_pipeline(
         args.pipeline, args.dl_weights, args.dl_conf,
         args.dl_imgsz, args.dl_every_k)
+
+    # If we're seeding from GT, inject the first GT frame as the
+    # exemplar and remove it from the eval set so we don't trivially
+    # score against the very box we used to seed.
+    seed_frame_excluded: Optional[int] = None
+    if args.seed_from_gt:
+        if args.pipeline != "motion_v3_hybrid":
+            print("--seed-from-gt requires --pipeline motion_v3_hybrid",
+                  file=sys.stderr)
+            sys.exit(2)
+        seed_frame = gt_frames[0]
+        seed_bbox = gt[seed_frame]
+        pipe.cfg.exemplar_frame = seed_frame
+        pipe.cfg.exemplar_bbox = seed_bbox
+        seed_frame_excluded = seed_frame
+        del gt[seed_frame]
+        print(f"seeded exemplar tracker at frame {seed_frame} "
+              f"bbox={seed_bbox}; that frame removed from eval")
+
     meta = probe(args.video)
     print(f"video: {meta.width}x{meta.height} @ {meta.fps:.1f}fps "
           f"({meta.n_frames} frames)  pipeline={args.pipeline}")
