@@ -42,8 +42,9 @@ class TrackerConfig:
     appearance_alpha: float = 0.2
 
     # ----- Deep ReID -----
-    use_reid: bool = True             # CNN embedding instead of patch NCC
-    reid_template_bank_size: int = 1  # Step C will raise this
+    use_reid: bool = True
+    reid_template_bank_size: int = 8       # DeepSORT-style sliding window
+    reid_bank_min_gap: float = 0.985       # avoid storing near-duplicate templates
     # Backwards-compat alias so existing code/configs keep working.
     @property
     def min_appearance_ncc(self) -> float:
@@ -154,7 +155,8 @@ class Tracker:
         self.state = TrackState.INIT
         self.bbox: tuple[int, int, int, int] | None = None
         self.coast_frames = 0
-        self.appearance: np.ndarray | None = None   # latest template / embedding
+        self.appearance: np.ndarray | None = None  # latest signature (legacy field)
+        self.appearance_bank: list[np.ndarray] = []  # newest-first
         self.last_score: float = 0.0
         self._reid = self._get_reid() if self.cfg.use_reid else None
 
@@ -184,13 +186,37 @@ class Tracker:
             return float(np.dot(a, b))
         return _ncc(a, b)             # 2-D patch → NCC
 
+    def _bank_similarity(self, sig: np.ndarray | None) -> float:
+        """Best similarity of `sig` against any template in the bank.
+        DeepSORT-style: a candidate matches the target if it matches
+        *any* recent appearance, not only the freshest EMA."""
+        if sig is None:
+            return 0.0
+        if self.appearance_bank:
+            return max(self._similarity(sig, t) for t in self.appearance_bank)
+        return self._similarity(sig, self.appearance)
+
+    def _push_to_bank(self, sig: np.ndarray | None) -> None:
+        if sig is None:
+            return
+        if (self.appearance_bank and
+                self._similarity(sig, self.appearance_bank[0])
+                >= self.cfg.reid_bank_min_gap):
+            return  # near-duplicate of the freshest entry; skip
+        self.appearance_bank.insert(0, sig)
+        if len(self.appearance_bank) > self.cfg.reid_template_bank_size:
+            self.appearance_bank = self.appearance_bank[: self.cfg.reid_template_bank_size]
+
     # ----- public API -----
     def init(self, gray: np.ndarray, det: Detection,
              frame_bgr: np.ndarray | None = None) -> None:
         self._reseed_kalman(det.bbox)
         self._csrt = cv2.TrackerCSRT_create()
         self._csrt.init(gray, det.bbox)
-        self.appearance = self._make_signature(gray, frame_bgr, det.bbox)
+        sig = self._make_signature(gray, frame_bgr, det.bbox)
+        self.appearance = sig
+        self.appearance_bank = []
+        self._push_to_bank(sig)
         self.bbox = det.bbox
         self.state = TrackState.TRACKING
         self.coast_frames = 0
@@ -241,7 +267,7 @@ class Tracker:
         score = 0.0
         if csrt_ok and csrt_bbox is not None:
             sig = self._make_signature(gray, frame_bgr, csrt_bbox)
-            app = self._similarity(sig, self.appearance)
+            app = self._bank_similarity(sig)
             if persistence is not None:
                 p_z = _persistence_z(persistence, csrt_bbox)
                 ok = (app >= self.cfg.min_appearance and
@@ -277,6 +303,8 @@ class Tracker:
             self.coast_frames = 0
             sig = self._make_signature(gray, frame_bgr, meas_bbox)
             if sig is not None:
+                # Maintain a sliding template bank AND a freshest-EMA pointer.
+                self._push_to_bank(sig)
                 if self.appearance is None:
                     self.appearance = sig
                 else:
@@ -370,9 +398,10 @@ class Tracker:
             # let either appearance or motion clear the bar. Without one
             # (DL pipeline) the detector's own confidence already gated
             # this candidate, so we just need it not to look like a
-            # totally different patch.
+            # totally different patch. We compare against the best entry
+            # in the template bank, not just the freshest EMA.
             sig = self._make_signature(gray, frame_bgr, d.bbox)
-            app = self._similarity(sig, self.appearance)
+            app = self._bank_similarity(sig)
             if persistence is not None:
                 p_z = _persistence_z(persistence, d.bbox)
                 if app < self.cfg.min_appearance and p_z < self.cfg.min_persistence_z:
