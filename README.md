@@ -10,11 +10,33 @@ occlusion.
 assets/                 input video + assignment PDF
 docs/                   working notes (literature review, design,
                         code walkthrough, etc.)
-src/baseline/           pipeline modules (see docs/06_code_walkthrough.md)
+src/baseline/           main pipeline modules (motion / dl / hybrid / follow /
+                        ids — see docs/06_code_walkthrough.md)
+src/baseline_v2/        frozen v2 motion baseline snapshot (commit 3f3aed1);
+                        independent of src/baseline/, no DL dependency
+                        (see docs/08_motion_v2_reference.md)
 scripts/                CLI runners
 outputs/                generated artefacts (gitignored)
 weights/                detector weights (.pt) — gitignored
 ```
+
+## Strong classical baseline (motion-v2, frozen)
+
+The strongest purely-classical (no DL) tracker built during this work
+is preserved as a standalone subpackage with its own runner. Use this
+as the "no-DL reference" for any comparison.
+
+```bash
+python scripts/run_motion_v2.py \
+    --video assets/How_to_hide_from_a_thermal_drone_Ukraine.mp4 \
+    --out outputs/motion_v2.mp4 \
+    --side-by-side
+```
+
+Stats on the assignment clip: **TRACKING 85.9 % / COASTING 12.9 %
+/ LOST 1.2 %**, 2 modality switches, ~10 fps CPU. See
+[`docs/08_motion_v2_reference.md`](docs/08_motion_v2_reference.md)
+for the full algorithm + math reference.
 
 ## Setup
 
