@@ -45,6 +45,14 @@ class TrackerConfig:
     use_reid: bool = True
     reid_template_bank_size: int = 8       # DeepSORT-style sliding window
     reid_bank_min_gap: float = 0.985       # avoid storing near-duplicate templates
+
+    # ----- Two-stage (ByteTrack-style) association -----
+    # A "priority" candidate (high-confidence DL person detection) is
+    # accepted by appearance match alone — the Mahalanobis gate is
+    # dropped because the detector's own person-class prior is already
+    # strong independent evidence.
+    priority_min_appearance: float = 0.35
+
     # Backwards-compat alias so existing code/configs keep working.
     @property
     def min_appearance_ncc(self) -> float:
@@ -210,14 +218,19 @@ class Tracker:
     # ----- public API -----
     def init(self, gray: np.ndarray, det: Detection,
              frame_bgr: np.ndarray | None = None) -> None:
-        self._reseed_kalman(det.bbox)
-        self._csrt = cv2.TrackerCSRT_create()
-        self._csrt.init(gray, det.bbox)
-        sig = self._make_signature(gray, frame_bgr, det.bbox)
+        bbox = self._sanitise_bbox(det.bbox, gray)
+        if bbox is None:
+            return  # degenerate seed; caller will retry next frame
+        csrt = self._try_csrt_init(gray, bbox)
+        if csrt is None:
+            return
+        self._reseed_kalman(bbox)
+        self._csrt = csrt
+        sig = self._make_signature(gray, frame_bgr, bbox)
         self.appearance = sig
         self.appearance_bank = []
         self._push_to_bank(sig)
-        self.bbox = det.bbox
+        self.bbox = bbox
         self.state = TrackState.TRACKING
         self.coast_frames = 0
         self.last_score = float(det.score)
@@ -225,7 +238,8 @@ class Tracker:
     def update(self, gray: np.ndarray, candidates: list[Detection],
                persistence: np.ndarray | None = None,
                ego_motion_H: np.ndarray | None = None,
-               frame_bgr: np.ndarray | None = None) -> TrackState_:
+               frame_bgr: np.ndarray | None = None,
+               priority: list[Detection] | None = None) -> TrackState_:
         """Update the tracker for one frame.
 
         `ego_motion_H` is the 3×3 homography that maps points from the
@@ -281,20 +295,55 @@ class Tracker:
             else:
                 score = app  # remember for diagnostics
 
-        # 4) If CSRT was rejected (or never ran), look in the Mahalanobis
-        #    gate of the *current* covariance. Gate widens automatically
-        #    during coast — no explicit "drop gate" branch.
+        # 4a) If CSRT was rejected and we have **high-confidence DL
+        #     detections** ("priority" candidates), try matching them by
+        #     appearance only — drop the spatial gate. Rationale
+        #     (ByteTrack / DeepSORT): a confident person-class detection
+        #     is strong independent evidence of the target identity, so
+        #     spatial inconsistency with a stale Kalman prediction should
+        #     not by itself disqualify it.
+        if meas_bbox is None and priority:
+            best: tuple[float, tuple[int, int, int, int]] | None = None
+            H, W = gray.shape
+            for d in priority:
+                bx, by, bw, bh = d.bbox
+                # Sanity-check the bbox before letting CSRT touch it.
+                if bw < 4 or bh < 4 or bx < 0 or by < 0 or \
+                        bx + bw > W or by + bh > H:
+                    continue
+                sig = self._make_signature(gray, frame_bgr, d.bbox)
+                app = self._bank_similarity(sig)
+                if app < self.cfg.priority_min_appearance:
+                    continue
+                if best is None or app > best[0]:
+                    best = (app, d.bbox)
+            if best is not None:
+                sane = self._sanitise_bbox(best[1], gray)
+                csrt = self._try_csrt_init(gray, sane) if sane is not None else None
+                if csrt is not None:
+                    meas_bbox = sane
+                    self._reseed_kalman(meas_bbox)
+                    self._csrt = csrt
+                    self.state = TrackState.TRACKING
+                    self.coast_frames = 0
+                score = max(score, best[0])
+
+        # 4b) Fall back to Mahalanobis gate on the full candidate pool.
         if meas_bbox is None:
             meas_bbox = self._mahalanobis_search(gray, frame_bgr,
                                                   candidates, persistence)
             if meas_bbox is not None:
-                # Treat as a fresh acquisition: reset CSRT and velocity.
-                self._reseed_kalman(meas_bbox)
-                self._csrt = cv2.TrackerCSRT_create()
-                self._csrt.init(gray, meas_bbox)
-                self.state = TrackState.TRACKING
-                self.coast_frames = 0
-                score = max(score, 0.5)
+                sane = self._sanitise_bbox(meas_bbox, gray)
+                csrt = self._try_csrt_init(gray, sane) if sane is not None else None
+                if csrt is not None:
+                    meas_bbox = sane
+                    self._reseed_kalman(meas_bbox)
+                    self._csrt = csrt
+                    self.state = TrackState.TRACKING
+                    self.coast_frames = 0
+                    score = max(score, 0.5)
+                else:
+                    meas_bbox = None
 
         # 5) Update model on success; otherwise coast / declare lost.
         if meas_bbox is not None:
@@ -325,6 +374,33 @@ class Tracker:
                             appearance=self.appearance)
 
     # ----- helpers -----
+    @staticmethod
+    def _sanitise_bbox(bbox: tuple[int, int, int, int],
+                        gray: np.ndarray,
+                        min_side: int = 8
+                        ) -> tuple[int, int, int, int] | None:
+        H, W = gray.shape[:2]
+        x, y, w, h = (int(v) for v in bbox)
+        # First clamp top-left into the image.
+        x = max(0, min(x, W - min_side))
+        y = max(0, min(y, H - min_side))
+        # Then clamp size against the remaining room.
+        w = max(min_side, min(w, W - x))
+        h = max(min_side, min(h, H - y))
+        if w < min_side or h < min_side:
+            return None
+        return x, y, w, h
+
+    @staticmethod
+    def _try_csrt_init(gray: np.ndarray,
+                        bbox: tuple[int, int, int, int]) -> "cv2.Tracker | None":
+        try:
+            tr = cv2.TrackerCSRT_create()
+            tr.init(gray, bbox)
+            return tr
+        except cv2.error:
+            return None
+
     def _warp_state_by_homography(self, H: np.ndarray) -> None:
         """Apply inter-frame homography H (prev→curr) to position and
         velocity in `statePost`. Velocity is warped via a finite-difference

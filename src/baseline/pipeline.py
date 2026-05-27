@@ -383,6 +383,11 @@ class HybridPipelineConfig:
 
     motion_weight: float = 0.05
 
+    # ByteTrack-style two-stage threshold. DL detections with raw
+    # confidence above this are passed as "priority" candidates that
+    # bypass the spatial gate.
+    dl_priority_conf: float = 0.20
+
     bad_diff_window: int = 20
     bad_diff_k: float = 3.0
     bad_diff_fraction: float = 0.30
@@ -503,8 +508,15 @@ class HybridPipeline:
                 self._streak = 0
                 self._last_center = None
         else:
+            # ByteTrack-style: high-conf raw DL detections are
+            # "priority" — accepted by appearance alone, no spatial
+            # gate.
+            priority = [d for d in dl_cands
+                         if d.score >= self.cfg.dl_priority_conf]
             ts = self.tracker.update(gray, fused, persistence=pmap,
-                                       ego_motion_H=Hmat, frame_bgr=frame_bgr)
+                                       ego_motion_H=Hmat,
+                                       frame_bgr=frame_bgr,
+                                       priority=priority)
 
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=fused,
                           track=ts, persistence=pmap,
