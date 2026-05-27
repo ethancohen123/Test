@@ -70,13 +70,13 @@ class Pipeline:
             if frame_idx >= self.cfg.init_frame_index:
                 seed = self._seed_detection(cands)
                 if seed is not None:
-                    self.tracker.init(gray, seed)
+                    self.tracker.init(gray, seed, frame_bgr=frame_bgr)
                     self._initialised = True
                     ts = TrackState_(bbox=seed.bbox,
                                       state=TrackState.TRACKING,
                                       coast_frames=0, score=float(seed.score))
         else:
-            ts = self.tracker.update(gray, cands)
+            ts = self.tracker.update(gray, cands, frame_bgr=frame_bgr)
 
         return StepResult(frame_idx=frame_idx, gray=gray,
                            candidates=cands, track=ts)
@@ -253,7 +253,7 @@ class MotionPipeline:
 
                 if self._candidate_streak >= self.cfg.min_init_persistence_frames:
                     seed = cands[0]
-                    self.tracker.init(gray, seed)
+                    self.tracker.init(gray, seed, frame_bgr=frame_bgr)
                     self._initialised = True
                     ts = TrackState_(bbox=seed.bbox,
                                       state=TrackState.TRACKING,
@@ -264,7 +264,7 @@ class MotionPipeline:
                 self._last_top_center = None
         else:
             ts = self.tracker.update(gray, cands, persistence=pmap,
-                                       ego_motion_H=H)
+                                       ego_motion_H=H, frame_bgr=frame_bgr)
 
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=cands,
                           track=ts, persistence=pmap,
@@ -333,7 +333,7 @@ class DLPipeline:
                 self._last_center = (cx, cy)
                 if self._streak >= self.cfg.init_streak:
                     seed = cands[0]
-                    self.tracker.init(gray, seed)
+                    self.tracker.init(gray, seed, frame_bgr=frame_bgr)
                     self._initialised = True
                     ts = TrackState_(bbox=seed.bbox,
                                       state=TrackState.TRACKING,
@@ -343,7 +343,7 @@ class DLPipeline:
                 self._streak = 0
                 self._last_center = None
         else:
-            ts = self.tracker.update(gray, cands, persistence=None)
+            ts = self.tracker.update(gray, cands, persistence=None, frame_bgr=frame_bgr)
 
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=cands,
                           track=ts, persistence=None, modality_switched=False)
@@ -494,7 +494,7 @@ class HybridPipeline:
                 self._last_center = (cx, cy)
                 if self._streak >= self.cfg.init_streak:
                     seed = fused[0]
-                    self.tracker.init(gray, seed)
+                    self.tracker.init(gray, seed, frame_bgr=frame_bgr)
                     self._initialised = True
                     ts = TrackState_(bbox=seed.bbox,
                                       state=TrackState.TRACKING,
@@ -504,7 +504,7 @@ class HybridPipeline:
                 self._last_center = None
         else:
             ts = self.tracker.update(gray, fused, persistence=pmap,
-                                       ego_motion_H=Hmat)
+                                       ego_motion_H=Hmat, frame_bgr=frame_bgr)
 
         return StepResult(frame_idx=frame_idx, gray=gray, candidates=fused,
                           track=ts, persistence=pmap,

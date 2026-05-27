@@ -25,7 +25,7 @@ class TrackerConfig:
     Bayesian-tracking principles:
 
       - `gate_sigma` is a Mahalanobis chi-square radius (sigma multiple).
-      - `min_appearance_ncc` is the standard NCC cut for visual match.
+      - `min_appearance` is the cosine (or NCC) cut for visual match.
       - `min_persistence_z` is a z-score (vs frame-wide median+MAD) for
         independent motion evidence.
 
@@ -37,9 +37,17 @@ class TrackerConfig:
     max_coast_frames: int = 30
     gate_sigma: float = 3.0           # Mahalanobis χ radius
     gate_min_radius_px: float = 12.0  # floor (we never trust a sub-pixel gate)
-    min_appearance_ncc: float = 0.30
+    min_appearance: float = 0.30      # NCC ≥ 0.3 OR cosine ≥ 0.3
     min_persistence_z: float = 2.0
     appearance_alpha: float = 0.2
+
+    # ----- Deep ReID -----
+    use_reid: bool = True             # CNN embedding instead of patch NCC
+    reid_template_bank_size: int = 1  # Step C will raise this
+    # Backwards-compat alias so existing code/configs keep working.
+    @property
+    def min_appearance_ncc(self) -> float:
+        return self.min_appearance
 
 
 @dataclass
@@ -136,6 +144,9 @@ class Tracker:
     list of candidate detections (used for re-acquisition when coasting).
     """
 
+    # Class-level cache so we share the heavy CNN across Tracker resets.
+    _reid_shared = None
+
     def __init__(self, cfg: TrackerConfig | None = None):
         self.cfg = cfg or TrackerConfig()
         self.kf = _make_kalman()
@@ -143,15 +154,43 @@ class Tracker:
         self.state = TrackState.INIT
         self.bbox: tuple[int, int, int, int] | None = None
         self.coast_frames = 0
-        self.appearance: np.ndarray | None = None
+        self.appearance: np.ndarray | None = None   # latest template / embedding
         self.last_score: float = 0.0
+        self._reid = self._get_reid() if self.cfg.use_reid else None
+
+    @classmethod
+    def _get_reid(cls):
+        if cls._reid_shared is None:
+            try:
+                from .reid import make_reid_extractor
+                cls._reid_shared = make_reid_extractor()
+            except Exception:
+                cls._reid_shared = False  # tried and failed
+        return cls._reid_shared or None
+
+    # ----- appearance abstraction -----
+    def _make_signature(self, gray: np.ndarray, frame_bgr: np.ndarray | None,
+                         bbox: tuple[int, int, int, int]) -> np.ndarray | None:
+        """Return either a CNN embedding (if ReID is on and we have BGR)
+        or a 32×32 mean-subtracted patch (legacy fallback)."""
+        if self._reid is not None and frame_bgr is not None:
+            return self._reid.embed(frame_bgr, bbox)
+        return _appearance_patch(gray, bbox)
+
+    def _similarity(self, a: np.ndarray | None, b: np.ndarray | None) -> float:
+        if a is None or b is None:
+            return 0.0
+        if a.ndim == 1:               # embedding → cosine (already L2-normed)
+            return float(np.dot(a, b))
+        return _ncc(a, b)             # 2-D patch → NCC
 
     # ----- public API -----
-    def init(self, gray: np.ndarray, det: Detection) -> None:
+    def init(self, gray: np.ndarray, det: Detection,
+             frame_bgr: np.ndarray | None = None) -> None:
         self._reseed_kalman(det.bbox)
         self._csrt = cv2.TrackerCSRT_create()
         self._csrt.init(gray, det.bbox)
-        self.appearance = _appearance_patch(gray, det.bbox)
+        self.appearance = self._make_signature(gray, frame_bgr, det.bbox)
         self.bbox = det.bbox
         self.state = TrackState.TRACKING
         self.coast_frames = 0
@@ -159,7 +198,8 @@ class Tracker:
 
     def update(self, gray: np.ndarray, candidates: list[Detection],
                persistence: np.ndarray | None = None,
-               ego_motion_H: np.ndarray | None = None) -> TrackState_:
+               ego_motion_H: np.ndarray | None = None,
+               frame_bgr: np.ndarray | None = None) -> TrackState_:
         """Update the tracker for one frame.
 
         `ego_motion_H` is the 3×3 homography that maps points from the
@@ -195,19 +235,19 @@ class Tracker:
         # 3) Gate the CSRT measurement. When a persistence map is
         #    available (motion pipeline) we AND-gate appearance with
         #    independent motion evidence. When it is absent (DL pipeline)
-        #    we rely on appearance NCC alone — the detector itself is
-        #    the second evidence source, applied earlier.
+        #    we rely on appearance similarity alone — the detector itself
+        #    is the second evidence source, applied earlier.
         meas_bbox: tuple[int, int, int, int] | None = None
         score = 0.0
         if csrt_ok and csrt_bbox is not None:
-            app = (_ncc(_appearance_patch(gray, csrt_bbox), self.appearance)
-                   if self.appearance is not None else 0.0)
+            sig = self._make_signature(gray, frame_bgr, csrt_bbox)
+            app = self._similarity(sig, self.appearance)
             if persistence is not None:
                 p_z = _persistence_z(persistence, csrt_bbox)
-                ok = (app >= self.cfg.min_appearance_ncc and
+                ok = (app >= self.cfg.min_appearance and
                       p_z >= self.cfg.min_persistence_z)
             else:
-                ok = app >= self.cfg.min_appearance_ncc
+                ok = app >= self.cfg.min_appearance
             if ok:
                 meas_bbox = csrt_bbox
                 score = app
@@ -219,7 +259,8 @@ class Tracker:
         #    gate of the *current* covariance. Gate widens automatically
         #    during coast — no explicit "drop gate" branch.
         if meas_bbox is None:
-            meas_bbox = self._mahalanobis_search(gray, candidates, persistence)
+            meas_bbox = self._mahalanobis_search(gray, frame_bgr,
+                                                  candidates, persistence)
             if meas_bbox is not None:
                 # Treat as a fresh acquisition: reset CSRT and velocity.
                 self._reseed_kalman(meas_bbox)
@@ -234,14 +275,15 @@ class Tracker:
             self.kf.correct(_bbox_to_meas(meas_bbox))
             self.bbox = meas_bbox
             self.coast_frames = 0
-            patch = _appearance_patch(gray, meas_bbox)
-            if self.appearance is None:
-                self.appearance = patch
-            else:
-                a = self.cfg.appearance_alpha
-                blended = (1 - a) * self.appearance + a * patch
-                n = np.linalg.norm(blended) + 1e-6
-                self.appearance = blended / n
+            sig = self._make_signature(gray, frame_bgr, meas_bbox)
+            if sig is not None:
+                if self.appearance is None:
+                    self.appearance = sig
+                else:
+                    a = self.cfg.appearance_alpha
+                    blended = (1 - a) * self.appearance + a * sig
+                    n = np.linalg.norm(blended) + 1e-6
+                    self.appearance = blended / n
         else:
             self.coast_frames += 1
             self.bbox = pred_bbox
@@ -286,6 +328,7 @@ class Tracker:
         self.kf.errorCovPre = self.kf.errorCovPost.copy()
 
     def _mahalanobis_search(self, gray: np.ndarray,
+                             frame_bgr: np.ndarray | None,
                              candidates: list[Detection],
                              persistence: np.ndarray | None
                              ) -> tuple[int, int, int, int] | None:
@@ -328,16 +371,14 @@ class Tracker:
             # (DL pipeline) the detector's own confidence already gated
             # this candidate, so we just need it not to look like a
             # totally different patch.
-            app = (_ncc(_appearance_patch(gray, d.bbox), self.appearance)
-                   if self.appearance is not None else 0.0)
+            sig = self._make_signature(gray, frame_bgr, d.bbox)
+            app = self._similarity(sig, self.appearance)
             if persistence is not None:
                 p_z = _persistence_z(persistence, d.bbox)
-                if app < self.cfg.min_appearance_ncc and p_z < self.cfg.min_persistence_z:
+                if app < self.cfg.min_appearance and p_z < self.cfg.min_persistence_z:
                     continue
                 s = app + 0.05 * p_z - 0.02 * mahal2
             else:
-                # Treat very-bad appearance as disqualifying; otherwise
-                # rank by detector score + small Mahalanobis penalty.
                 if app < -0.2:
                     continue
                 s = app + 0.001 * float(d.score) - 0.02 * mahal2
