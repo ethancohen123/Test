@@ -42,16 +42,34 @@ from .tracker import (TrackState, _bbox_to_meas, _make_kalman,
 @dataclass
 class IdentityTrackerConfig:
     # Two-stage detection split (ByteTrack-style)
-    high_conf_thresh: float = 0.20
+    high_conf_thresh: float = 0.15
 
     # Gating thresholds for the three matching stages
-    iou_gate: float = 0.30          # min IoU to call a Stage-1 match
-    app_gate: float = 0.40          # min cosine sim for Stage-2 match
-    reid_gate: float = 0.55         # min cosine sim for Stage-3 re-ID
+    iou_gate: float = 0.20          # min IoU to call a Stage-1 match
+    app_gate: float = 0.30          # min cosine sim for Stage-2 match
+    reid_gate: float = 0.45         # min cosine sim for Stage-3 re-ID
 
-    # Track lifecycle
-    max_coast_frames: int = 20
-    max_lost_age: int = 90          # ≈ 3 s @ 30 fps
+    # DeepSORT-style two-state lifecycle.
+    #   Tentative tracks (hits < tentative_hits) live a *short* coast
+    #   budget and are never rendered publicly. This kills one-shot
+    #   YOLO false positives before they pollute the visualisation.
+    #   Once a track reaches `tentative_hits`, it is "confirmed" and
+    #   gets a much longer coast budget so it survives YOLO misses
+    #   (the person hiding behind a bush, fast camera pan, …).
+    tentative_hits: int = 3
+    tentative_max_coast: int = 3
+    confirmed_max_coast: int = 60   # 2 s @ 30 fps
+
+    # How long a lost (formerly confirmed) track can wait in the lost
+    # pool before being expired forever.
+    max_lost_age: int = 240         # 8 s @ 30 fps
+
+    # Only spawn new tracks from confident detections; below this floor,
+    # an unmatched detection is treated as a one-shot noise blob and
+    # ignored (no new ID). Calibrated against the actual confidence
+    # range of the thermal-trained YOLO checkpoint on our clip (0.05-0.35).
+    birth_min_conf: float = 0.10
+
     reid_bank_size: int = 8
     reid_bank_min_gap: float = 0.985
 
@@ -70,6 +88,7 @@ class IdentityTrack:
     hits: int = 1                          # frames matched to a detection
     last_seen_frame: int = 0
     last_conf: float = 0.0
+    confirmed: bool = False                # promoted from tentative
     appearance: np.ndarray | None = field(default=None, repr=False)
     bank: list[np.ndarray] = field(default_factory=list, repr=False)
     kf: cv2.KalmanFilter = field(default=None, repr=False)  # type: ignore[assignment]
@@ -227,6 +246,8 @@ class IdentityTracker:
         t.hits += 1
         t.last_seen_frame = self._frame_idx
         t.last_conf = float(d.score)
+        if t.hits >= self.cfg.tentative_hits:
+            t.confirmed = True
         sig = self._embed(frame_bgr, sane)
         if sig is not None:
             t.appearance = sig
@@ -368,14 +389,18 @@ class IdentityTracker:
             self.lost = new_lost
 
         # ---- Stage 4: birth new tracks for the remaining detections ----
+        # Only confident detections seed an ID — otherwise every YOLO
+        # false positive would spawn its own track and clutter the
+        # visualisation. The new track is *tentative* until it has
+        # accumulated `tentative_hits` matched frames.
         for di in sorted(unmatched_dets):
             d = detections[di]
-            # Don't spawn tracks from very low-conf detections — those are
-            # detector noise; let them go.
-            if d.score >= max(0.05, self.cfg.high_conf_thresh * 0.5):
+            if d.score >= self.cfg.birth_min_conf:
                 self._birth_track(d, gray, frame_bgr)
 
         # ---- Coast every active track that didn't get matched ----
+        # Two budgets, DeepSORT-style: tentative tracks die fast,
+        # confirmed tracks survive a long YOLO silence.
         survived_active: list[IdentityTrack] = []
         for t in self.active:
             if t.last_seen_frame == self._frame_idx:
@@ -386,9 +411,17 @@ class IdentityTracker:
             sane = _sanitise_bbox(t.bbox, gray.shape, self.cfg.min_bbox_side)
             if sane is not None:
                 t.bbox = sane
-            if t.coast_frames > self.cfg.max_coast_frames:
-                t.state = TrackState.LOST
-                self.lost.append(t)
+
+            is_confirmed = t.hits >= self.cfg.tentative_hits
+            budget = (self.cfg.confirmed_max_coast if is_confirmed
+                      else self.cfg.tentative_max_coast)
+            if t.coast_frames > budget:
+                if is_confirmed:
+                    # Confirmed tracks go to the lost pool for ReID.
+                    t.state = TrackState.LOST
+                    self.lost.append(t)
+                # Tentative tracks just die quietly — no ReID, no slot
+                # in the lost pool. (They were probably noise.)
             else:
                 t.state = TrackState.COASTING
                 survived_active.append(t)

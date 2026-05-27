@@ -116,10 +116,14 @@ def main() -> None:
 
             # Two render paths: multi-ID pipeline vs single-target pipelines.
             if args.pipeline == "ids":
+                # Only show *confirmed* tracks (DeepSORT-style) — tentative
+                # tracks are still tracked internally so they can be promoted,
+                # but they don't clutter the screen with one-shot YOLO noise.
+                visible_tracks = [t for t in res.tracks if t.confirmed]
                 annotated = draw_candidates(frame, res.candidates)
-                annotated = draw_identity_tracks(annotated, res.tracks)
-                # Count active tracks by state for the stats line.
-                for t in res.tracks:
+                annotated = draw_identity_tracks(annotated, visible_tracks)
+                # Count active confirmed tracks by state for the stats line.
+                for t in visible_tracks:
                     counts[t.state] = counts.get(t.state, 0) + 1
                     id_max_seen = max(id_max_seen, t.id)
                 annotated = draw_hud(annotated, idx,
@@ -127,7 +131,7 @@ def main() -> None:
                 if args.side_by_side:
                     annotated = side_by_side(res.gray, annotated)
                 lost_count = len(getattr(pipe.id_tracker, 'lost', []))
-                annotated = draw_identity_legend(annotated, res.tracks,
+                annotated = draw_identity_legend(annotated, visible_tracks,
                                                    lost_count=lost_count)
             else:
                 annotated = draw_candidates(frame, res.candidates)
