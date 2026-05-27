@@ -211,6 +211,11 @@ def main() -> None:
     p.add_argument("--dl-conf", type=float, default=0.05)
     p.add_argument("--dl-imgsz", type=int, default=640)
     p.add_argument("--dl-every-k", type=int, default=3)
+    p.add_argument("--mask-top", type=int, default=0,
+                   help="Zero out the top N rows of every frame before "
+                        "passing it to the pipeline. Use to suppress "
+                        "screen-recording chrome (e.g., player UI baked "
+                        "into the 1-shot annotated clip).")
     args = p.parse_args()
 
     out_json = Path(args.out) if args.out else (
@@ -250,6 +255,8 @@ def main() -> None:
     t0 = time.time()
 
     for idx, frame in iter_frames(args.video):
+        if args.mask_top > 0:
+            frame[:args.mask_top, :] = 0
         res = pipe.step(idx, frame)
         pred: Optional[BBox] = None
         if getattr(res, "track", None) is not None:
