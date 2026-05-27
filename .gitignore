@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+outputs/
+*.egg-info/
+.ipynb_checkpoints/
+
+# DL weights — track via release / external storage, not in main branch
+weights/*.pt
+!weights/.gitkeep
